@@ -43,9 +43,10 @@ def assign_themes(name, industry, sub_industry):
         themes.append("Semiconductors")
     if "blockchain" in name or "crypto" in name or "bitcoin" in name:
         themes.append("Crypto")
+
     return ", ".join(sorted(set(themes))) if themes else None
 
-# === PROCESS EACH ROW ===
+# === FETCH GICS USING YAHOO FINANCE ===
 for i, row in df.iterrows():
     symbol = row['Symbol']
     if pd.notna(row['Sector']) and pd.notna(row['Industry']) and pd.notna(row['Sub-Industry']):
@@ -72,8 +73,12 @@ for i, row in df.iterrows():
         continue
 
 # === APPLY THEMES ===
+name_col = "Name"
+if "Name" not in df.columns:
+    name_col = "Name_x" if "Name_x" in df.columns else "Name_y"
+
 df["Theme(s)"] = df.apply(
-    lambda row: assign_themes(str(row["Name"]), str(row["Industry"]), str(row["Sub-Industry"])),
+    lambda row: assign_themes(str(row[name_col]), str(row["Industry"]), str(row["Sub-Industry"])),
     axis=1
 )
 
