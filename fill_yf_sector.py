@@ -10,6 +10,10 @@ KNOWN_EX_SUFFIXES = {
     ".TO",".V",".CN",".AX",".L",".SW",".PA",".BR",".BE",".DE",".F",".HM",".MU",".SG",
     ".ST",".HE",".MI",".AS",".MC",".WA",".VI",".IR",".IS",".HK",".KS",".KQ",".T",".TW"
 }
+DEFAULT_TICKER_COL = "Symbol"
+DEFAULT_EXCHANGE_COL = "Exchange"
+DEFAULT_SECTOR_COL = "Sector (YF)"
+DEFAULT_INDUSTRY_COL = "Industry (YF)"
 # ----------------------------
 
 st.set_page_config(page_title="Fill Sector/Industry from Yahoo Finance", layout="wide")
@@ -17,21 +21,20 @@ st.title("📊 Fill Sector/Industry from Yahoo Finance")
 
 with st.sidebar:
     st.header("Settings")
-    ticker_col_name = st.text_input("Ticker column name", value="Symbol")
-    exchange_col_name = st.text_input("Exchange column (optional)", value="Exchange")
-    sector_col_name = st.text_input("Output column: Sector", value="Sector (YF)")
-    industry_col_name = st.text_input("Output column: Industry", value="Industry (YF)")
+    ticker_col_name = st.text_input("Ticker column name", value=DEFAULT_TICKER_COL)
+    exchange_col_name = st.text_input("Exchange column (optional)", value=DEFAULT_EXCHANGE_COL)
+    sector_col_name = st.text_input("Output column: Sector", value=DEFAULT_SECTOR_COL)
+    industry_col_name = st.text_input("Output column: Industry", value=DEFAULT_INDUSTRY_COL)
     skip_filled = st.checkbox("Skip rows already filled (both columns)", value=True)
     request_delay = st.number_input("Delay per request (seconds)", value=0.7, step=0.1, min_value=0.0)
     max_retries = st.number_input("Max retries per ticker", value=1, step=1, min_value=0)
     checkpoint_every = st.number_input("Checkpoint save every N rows", value=50, step=10, min_value=10)
-    do_exists_check = st.checkbox("Pre-check ticker exists (faster fail on dead tickers)", value=True)
+    do_exists_check = st.checkbox("Pre-check ticker exists (use only for cleanup)", value=False)
     st.caption("Tip: Increase delay if you hit Yahoo rate limits.")
 
 uploaded = st.file_uploader("Upload your Excel file", type=["xlsx"])
 sheet_name = None
 
-# Silence chatty logs from libs
 logging.getLogger("yfinance").setLevel(logging.ERROR)
 
 if uploaded:
@@ -56,21 +59,18 @@ if uploaded:
     with st.expander("Preview uploaded data"):
         st.dataframe(df.head(20), use_container_width=True)
 
-    # yfinance (lazy import so the app page renders)
+    # Lazy import yfinance so UI renders even if missing
     try:
         import yfinance as yf
     except Exception:
         st.error("`yfinance` is not installed. Add to requirements.txt:\n\n`yfinance>=0.2.40`")
         st.stop()
 
-    class_share_pat = re.compile(r"^[A-Z]+\.([A-Z0-9]{1,3})$")  # broader: e.g., BRK.B, XYZ.A, ABC.A1
+    # --- Mapping for US class-share tickers (BRK.B -> BRK-B); preserve real exchange suffixes (.L, .TO, etc.)
+    class_share_pat = re.compile(r"^[A-Z]+\.([A-Z0-9]{1,3})$")
 
-    def map_to_yahoo_symbol(symbol: str, exchange: str | None) -> str:
-        """
-        Convert US class-share tickers with a dot to Yahoo's dash (BRK.B -> BRK-B).
-        Preserve true exchange suffixes like .L, .TO, .HK, etc.
-        """
-        sym = str(symbol).strip().upper()
+    def map_to_yahoo_symbol(symbol, exchange):
+        sym = str(symbol).strip().upper() if symbol is not None else ""
         if not sym:
             return sym
         for suf in KNOWN_EX_SUFFIXES:
@@ -78,11 +78,11 @@ if uploaded:
                 return sym  # keep native exchange suffix as-is
 
         is_us = False
-        if exchange:
+        if exchange is not None:
             ex = str(exchange).strip().upper()
             if any(k in ex for k in ("NYSE", "NASDAQ", "NSDQ", "OTC", "ARCA", "BATS", "AMEX", "NYSEMKT", "NMS")):
                 is_us = True
-        if not exchange and class_share_pat.match(sym):
+        if exchange in (None, "", "nan") and class_share_pat.match(sym):
             is_us = True
 
         if is_us and "." in sym:
@@ -92,46 +92,75 @@ if uploaded:
         return sym
 
     @st.cache_data(ttl=60*60*24, show_spinner=False)
-    def cached_get_info(yf_symbol: str) -> dict:
+    def cached_get_info(yf_symbol):
         """
-        Cached metadata fetch. Returns dict with optional keys sector/industry.
-        Never raises – returns {} on failure.
+        Cached metadata fetch. Returns dict {'sector':..., 'industry':...}.
+        Returns {} on failure; never raises.
         """
         try:
             t = yf.Ticker(yf_symbol)
+            info = {}
             try:
                 info = t.get_info()
             except Exception:
-                # fallback to legacy .info
-                info = getattr(t, "info", {}) or {}
+                try:
+                    info = getattr(t, "info", {}) or {}
+                except Exception:
+                    info = {}
             if not isinstance(info, dict):
                 return {}
-            return {
-                "sector": (info.get("sector") or None),
-                "industry": (info.get("industry") or info.get("industryKey") or info.get("industryDisp") or None),
-            }
+            sector = info.get("sector")
+            industry = info.get("industry") or info.get("industryKey") or info.get("industryDisp")
+            sector = sector if sector and str(sector).strip() else None
+            industry = industry if industry and str(industry).strip() else None
+            return {"sector": sector, "industry": industry}
         except Exception:
             return {}
 
     @st.cache_data(ttl=60*60*24, show_spinner=False)
-    def cached_exists(yf_symbol: str) -> bool:
+    def cached_exists(yf_symbol):
         """
-        Lightweight existence check. Uses fast_info as a proxy; if it blows up or
-        has no market/last_price, assume not tradable.
+        Conservative existence check that FAILS OPEN.
+        Only returns False if we can clearly confirm non-existence across methods.
+        Otherwise returns True to avoid false negatives on Streamlit Cloud.
         """
+        import yfinance as yf
         try:
             t = yf.Ticker(yf_symbol)
-            # some symbols return an empty dict – treat as non-existent
+
+            # 1) get_info has some basic keys for live symbols
+            try:
+                info = t.get_info()
+                if isinstance(info, dict) and (
+                    info.get("quoteType") or info.get("shortName") or info.get("longName") or info.get("sector")
+                ):
+                    return True
+            except Exception:
+                pass
+
+            # 2) recent history
+            try:
+                hist = t.history(period="5d", interval="1d", auto_adjust=False)
+                if hist is not None and not hist.empty:
+                    return True
+            except Exception:
+                pass
+
+            # 3) fast_info (use only to confirm, never to deny)
             fi = getattr(t, "fast_info", None)
-            if not fi:
-                # last resort: 1d history – may still 404 but is cached
-                hist = t.history(period="1d")
-                return not hist.empty
-            # Many dead tickers have missing attributes entirely
-            market = getattr(fi, "market", None)
-            return market is not None
+            try:
+                if fi:
+                    last_price = getattr(fi, "last_price", None)
+                    market = getattr(fi, "market", None)
+                    if last_price is not None or market is not None:
+                        return True
+            except Exception:
+                pass
+
+            # Could not confirm either way → fail open
+            return True
         except Exception:
-            return False
+            return True
 
     # Build worklist
     work_indices = []
@@ -139,7 +168,6 @@ if uploaded:
         sym = str(row.get(ticker_col_name, "")).strip()
         if not sym:
             continue
-        # skip if already filled
         if skip_filled:
             filled_sector = df.at[i, sector_col_name]
             filled_ind = df.at[i, industry_col_name]
@@ -162,6 +190,19 @@ if uploaded:
         buf.seek(0)
         st.session_state.partial_bytes = buf.getvalue()
 
+    # Optional: single-ticker tester
+    with st.expander("🔎 Single-Ticker Tester"):
+        test_sym = st.text_input("Symbol (e.g., BRK.B, SHOP.TO, AI)", "")
+        test_ex = st.text_input("Exchange (optional, helps for US vs non-US)", "")
+        if st.button("Test mapping & fetch", use_container_width=False):
+            if test_sym:
+                mapped = map_to_yahoo_symbol(test_sym, test_ex)
+                st.write(f"Mapped → **{mapped}**")
+                if do_exists_check:
+                    st.write(f"Exists check: **{cached_exists(mapped)}**")
+                meta = cached_get_info(mapped)
+                st.write(f"Sector: **{meta.get('sector')}**, Industry: **{meta.get('industry')}**")
+
     colA, colB = st.columns([1,1])
     start = colA.button("▶️ Start Filling from Yahoo")
     clear_logs = colB.button("🧹 Clear logs")
@@ -175,8 +216,6 @@ if uploaded:
         status = st.empty()
         processed = 0
         failures = 0
-
-        # Error log rows we will turn into a DataFrame at the end
         err_rows = []
 
         for k, idx in enumerate(work_indices, start=1):
@@ -184,13 +223,12 @@ if uploaded:
             exch = str(df.at[idx, exchange_col_name]).strip() if exchange_col_name in df.columns else None
             yf_sym = map_to_yahoo_symbol(sym, exch)
 
-            # Optional quick existence check
+            # Optional quick existence check (fails open; rarely returns False)
             if do_exists_check and not cached_exists(yf_sym):
                 failures += 1
                 err_rows.append({"Symbol": sym, "Mapped": yf_sym, "Status": "not_found", "Sector": None, "Industry": None, "Error": "existence_check_failed"})
                 status.write(f"❌ {k}/{len(work_indices)} • {sym} → {yf_sym} • not found (pre-check)")
-                # still checkpoint and continue
-                if k % checkpoint_every == 0:
+                if k % int(checkpoint_every) == 0:
                     save_checkpoint(df)
                 processed += 1
                 progress.progress(int(100 * processed / len(work_indices)))
@@ -203,7 +241,6 @@ if uploaded:
             for attempt in range(int(max_retries) + 1):
                 try:
                     result = cached_get_info(yf_sym)
-                    # If we got at least something, break
                     if result.get("sector") or result.get("industry"):
                         break
                 except Exception as e:
@@ -213,7 +250,7 @@ if uploaded:
             sector = result.get("sector")
             industry = result.get("industry")
 
-            # Write back only explicit values (avoid FutureWarning)
+            # Assign only explicit strings to avoid FutureWarnings
             if isinstance(sector, str) and sector.strip():
                 df.at[idx, sector_col_name] = sector.strip()
             if isinstance(industry, str) and industry.strip():
@@ -222,15 +259,16 @@ if uploaded:
             ok = bool((isinstance(sector, str) and sector.strip()) or (isinstance(industry, str) and industry.strip()))
             if not ok:
                 failures += 1
-                err_rows.append({"Symbol": sym, "Mapped": yf_sym, "Status": "empty", "Sector": sector, "Industry": industry, "Error": last_err_msg})
+                err_rows.append({
+                    "Symbol": sym, "Mapped": yf_sym, "Status": "empty",
+                    "Sector": sector, "Industry": industry, "Error": last_err_msg
+                })
 
             processed += 1
             progress.progress(int(100 * processed / len(work_indices)))
             prefix = "✅" if ok else "⚠️"
-            status.write(f"{prefix} {k}/{len(work_indices)} • {sym} → {yf_sym} • "
-                         f"Sector='{sector}' Industry='{industry}'")
+            status.write(f"{prefix} {k}/{len(work_indices)} • {sym} → {yf_sym} • Sector='{sector}' Industry='{industry}'")
 
-            # polite throttle
             time.sleep(request_delay)
 
             # Checkpoint
@@ -238,24 +276,25 @@ if uploaded:
                 save_checkpoint(df)
                 st.info(f"Checkpoint saved at {k} rows.")
 
-        # Save final checkpoint
+        # Final checkpoint
         save_checkpoint(df)
         st.success(f"Done. Processed {processed} rows. Empty/failed: {failures}")
 
-        # Persist logs in session and present downloads
         if err_rows:
             logs_df = pd.DataFrame(err_rows)
             st.session_state.logs = err_rows
             st.subheader("Errors / Empty Results")
-            st.dataframe(logs_df.head(100), use_container_width=True)
+            st.dataframe(logs_df.head(200), use_container_width=True)
 
-            # Download logs
             csv_buf = io.StringIO()
             logs_df.to_csv(csv_buf, index=False)
-            st.download_button("⬇️ Download error log (CSV)", data=csv_buf.getvalue(),
-                               file_name="yf_sector_errors.csv", mime="text/csv")
+            st.download_button(
+                "⬇️ Download error log (CSV)",
+                data=csv_buf.getvalue(),
+                file_name="yf_sector_errors.csv",
+                mime="text/csv",
+            )
 
-        # Show a sample and enable full download
         st.subheader("Sample of Updated Data")
         st.dataframe(df.head(50), use_container_width=True)
 
