@@ -1,186 +1,191 @@
-# fill_yf_sector.py
-import os, re, json, time, math
+import io
+import re
+import time
+import json
 import pandas as pd
+import streamlit as st
 
-# ---------- CONFIG ----------
-INPUT_XLSX  = r"/mnt/data/Copy of Russell 3000.xlsx"  # change to your local path if needed
-SHEET_NAME  = None  # None = first sheet; or set to a name like "Sheet1"
-TICKER_COL  = "Symbol"  # change if your column is named differently
-EXCHANGE_COL = "Exchange"  # optional; improves symbol mapping for US vs non-US
-OUTPUT_XLSX = os.path.splitext(INPUT_XLSX)[0] + " - with YF Sectors.xlsx"
-CACHE_JSON  = os.path.splitext(INPUT_XLSX)[0] + " - yf_sector_cache.json"
-REQUEST_DELAY_SEC = 0.6  # be nice to Yahoo; increase if you hit rate limits
+# ---------- Config ----------
+KNOWN_EX_SUFFIXES = {
+    ".TO",".V",".CN",".AX",".L",".SW",".PA",".BR",".BE",".DE",".F",".HM",".MU",".SG",
+    ".ST",".HE",".MI",".AS",".MC",".WA",".VI",".IR",".IS",".HK",".KS",".KQ",".T",".TW"
+}
+REQUEST_DELAY_SEC = 0.6  # be nice to Yahoo in shared environments
+MAX_RETRIES = 2          # per ticker
 # ----------------------------
 
-# yfinance import
-try:
-    import yfinance as yf
-except ImportError:
-    raise SystemExit("Please install yfinance first: pip install yfinance>=0.2.40")
+st.set_page_config(page_title="Fill Yahoo Sectors", layout="wide")
+st.title("📊 Fill Sector/Industry from Yahoo Finance")
 
-# yfinance moved .info → .get_info() in recent versions; we’ll prefer .get_info()
-def safe_get_info(t: "yf.Ticker") -> dict:
-    """Robustly fetch metadata dict from yfinance."""
-    # Try get_info (new API). Fallback to .info if present.
-    d = {}
+with st.sidebar:
+    st.header("Settings")
+    ticker_col_name = st.text_input("Ticker column name", value="Symbol")
+    exchange_col_name = st.text_input("Exchange column (optional)", value="Exchange")
+    sector_col_name = st.text_input("Output column: Sector", value="Sector (YF)")
+    industry_col_name = st.text_input("Output column: Industry", value="Industry (YF)")
+    skip_filled = st.checkbox("Skip rows where both outputs are already filled", value=True)
+    st.caption("Tip: Keep defaults unless your file uses different column names.")
+
+uploaded = st.file_uploader("Upload your Excel file", type=["xlsx"])
+sheet_name = None
+if uploaded:
     try:
-        d = t.get_info()
-        if isinstance(d, dict) and d:
-            return d
-    except Exception:
-        pass
+        xl = pd.ExcelFile(uploaded)
+        if len(xl.sheet_names) > 1:
+            sheet_name = st.selectbox("Choose a sheet", options=xl.sheet_names, index=0)
+        else:
+            sheet_name = 0
+        df = xl.parse(sheet_name)
+    except Exception as e:
+        st.error(f"Could not read Excel: {e}")
+        st.stop()
+
+    # Basic checks
+    if ticker_col_name not in df.columns:
+        st.error(f"Column '{ticker_col_name}' not found. Available: {list(df.columns)}")
+        st.stop()
+
+    # Ensure output columns exist
+    if sector_col_name not in df.columns:
+        df[sector_col_name] = None
+    if industry_col_name not in df.columns:
+        df[industry_col_name] = None
+
+    # Optional preview
+    with st.expander("Preview uploaded data"):
+        st.dataframe(df.head(20), use_container_width=True)
+
+    # --------- yfinance setup (lazy import) ----------
     try:
-        d = getattr(t, "info", {})
-    except Exception:
-        d = {}
-    return d if isinstance(d, dict) else {}
+        import yfinance as yf
+    except Exception as e:
+        st.error("`yfinance` is not installed. Add it to requirements.txt:\n\n`yfinance>=0.2.40`")
+        st.stop()
 
-# Simple heuristic: convert US class-share dot tickers (e.g., BRK.B) to Yahoo’s dash form (BRK-B)
-# but leave true exchange suffixes (e.g., .TO, .L, .DE) intact.
-KNOWN_EX_SUFFIXES = {".TO",".V",".CN",".AX",".L",".SW",".PA",".BR",".BE",".DE",".F",".HM",".MU",".SG",
-                     ".ST",".HE",".MI",".AS",".MC",".WA",".VI",".IR",".IS",".HK",".KS",".KQ",".T",".TW"}
+    class_share_pat = re.compile(r"^[A-Z]+\.([A-Z]|[A-Z]\d)$")
 
-CLASS_SHARE_DOT_PATTERN = re.compile(r"^[A-Z]+\.([A-Z]|[A-Z]\d)$")  # e.g., BRK.B or ABC.A1
+    def map_to_yahoo_symbol(symbol: str, exchange: str | None) -> str:
+        """Map class-share US tickers like BRK.B to BRK-B, preserve true exchange suffixes."""
+        sym = str(symbol).strip().upper()
+        if not sym:
+            return sym
+        # Keep known non-US suffixes
+        for suf in KNOWN_EX_SUFFIXES:
+            if sym.endswith(suf):
+                return sym
 
-def map_to_yahoo_symbol(symbol: str, exchange: str | None) -> str:
-    sym = str(symbol).strip().upper()
-    if not sym:
-        return sym
-
-    # If symbol already contains a known exchange suffix that’s not the US class-share pattern, leave it.
-    for suf in KNOWN_EX_SUFFIXES:
-        if sym.endswith(suf):
-            return sym  # keep .TO/.L/etc.
-
-    # If we have an Exchange column and it looks like US, apply class-share mapping
-    is_us = False
-    if exchange:
-        ex = str(exchange).strip().upper()
-        # Common US flags
-        if any(k in ex for k in ("NYSE", "NASDAQ", "NSDQ", "OTC", "ARCA", "BATS", "AMEX", "NYSEMKT", "NMS")):
+        is_us = False
+        if exchange:
+            ex = str(exchange).strip().upper()
+            if any(k in ex for k in ("NYSE", "NASDAQ", "NSDQ", "OTC", "ARCA", "BATS", "AMEX", "NYSEMKT", "NMS")):
+                is_us = True
+        if not exchange and class_share_pat.match(sym):
             is_us = True
 
-    # If Exchange not provided, guess: if it has a dot and matches class-share pattern, treat as US
-    if not exchange and CLASS_SHARE_DOT_PATTERN.match(sym):
-        is_us = True
+        if is_us and "." in sym:
+            base, tail = sym.split(".", 1)
+            if re.fullmatch(r"[A-Z]\d?|[A-Z]", tail):
+                return f"{base}-{tail}"
+        return sym
 
-    if is_us and "." in sym:
-        # Convert BRK.B → BRK-B; keep anything else intact
-        base, tail = sym.split(".", 1)
-        # Only convert if it looks like a share class (single letter or letter+digit)
-        if re.fullmatch(r"[A-Z]\d?|[A-Z]", tail):
-            return f"{base}-{tail}"
-    return sym
-
-def load_cache(path: str) -> dict:
-    if os.path.exists(path):
+    @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+    def cached_fetch(yf_symbol: str) -> dict:
+        """Cached fetch for a single ticker: returns {'sector':..., 'industry':...} (can be None)."""
+        # Try new API first
+        t = yf.Ticker(yf_symbol)
+        info = {}
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            info = t.get_info()
         except Exception:
-            return {}
-    return {}
+            # fallback to old .info if still available
+            try:
+                info = getattr(t, "info", {}) or {}
+            except Exception:
+                info = {}
 
-def save_cache(path: str, data: dict) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+        sector = info.get("sector")
+        industry = info.get("industry") or info.get("industryKey") or info.get("industryDisp")
+        sector = sector if sector and str(sector).strip() else None
+        industry = industry if industry and str(industry).strip() else None
+        return {"sector": sector, "industry": industry}
 
-def fetch_sector_industry(yf_symbol: str) -> tuple[str | None, str | None]:
-    """Return (sector, industry) from Yahoo for a given symbol."""
-    t = yf.Ticker(yf_symbol)
-    info = safe_get_info(t)
-    if not info:
-        return (None, None)
-    sector = info.get("sector") or info.get("longBusinessSummary", None)  # fallback not ideal
-    industry = info.get("industry") or info.get("industryKey") or info.get("industryDisp")
-    # Normalize empty strings to None
-    sector = sector if (sector and str(sector).strip()) else None
-    industry = industry if (industry and str(industry).strip()) else None
-    return (sector, industry)
-
-def main():
-    if not os.path.exists(INPUT_XLSX):
-        raise SystemExit(f"Input file not found:\n{INPUT_XLSX}")
-
-    df = pd.read_excel(INPUT_XLSX, sheet_name=SHEET_NAME)
-    if TICKER_COL not in df.columns:
-        raise SystemExit(f"Column '{TICKER_COL}' not found. Available columns: {list(df.columns)}")
-
-    if "Sector (YF)" not in df.columns:
-        df["Sector (YF)"] = pd.Series([None] * len(df))
-    if "Industry (YF)" not in df.columns:
-        df["Industry (YF)"] = pd.Series([None] * len(df))
-
-    cache = load_cache(CACHE_JSON)
+    def fetch_with_retry(yf_symbol: str) -> dict:
+        last_err = None
+        for attempt in range(1, MAX_RETRIES + 2):
+            try:
+                res = cached_fetch(yf_symbol)
+                return res
+            except Exception as e:
+                last_err = e
+                time.sleep(0.75 * attempt)
+        return {"sector": None, "industry": None, "error": str(last_err) if last_err else "unknown"}
 
     # Build worklist
-    total = len(df)
-    unique_pairs = {}  # original index -> yf_symbol
+    work_indices = []
     for i, row in df.iterrows():
-        sym = str(row[TICKER_COL]).strip()
-        if not sym or sym.lower() == "nan":
+        sym = str(row.get(ticker_col_name, "")).strip()
+        if not sym:
             continue
-        exch = str(row[EXCHANGE_COL]).strip() if EXCHANGE_COL in df.columns else None
-        yf_sym = map_to_yahoo_symbol(sym, exch)
-        unique_pairs[i] = yf_sym
+        if skip_filled:
+            if (str(df.at[i, sector_col_name]).strip() not in ("", "None", "nan") and
+                str(df.at[i, industry_col_name]).strip() not in ("", "None", "nan")):
+                continue
+        work_indices.append(i)
 
-    # Fetch loop
-    done = 0
-    for idx, yf_sym in unique_pairs.items():
-        # Skip if already present in dataframe (non-empty) or cached
-        cur_sector = df.at[idx, "Sector (YF)"]
-        cur_industry = df.at[idx, "Industry (YF)"]
-        if (isinstance(cur_sector, str) and cur_sector.strip()) and (isinstance(cur_industry, str) and cur_industry.strip()):
-            done += 1
-            continue
+    st.write(f"Tickers to process: **{len(work_indices)}** (of {len(df)})")
 
-        cache_key = yf_sym
-        if cache_key in cache and isinstance(cache[cache_key], dict):
-            res = cache[cache_key]
-            df.at[idx, "Sector (YF)"] = res.get("sector")
-            df.at[idx, "Industry (YF)"] = res.get("industry")
-            done += 1
-            continue
+    start = st.button("▶️ Start Filling from Yahoo")
+    if start and work_indices:
+        progress = st.progress(0)
+        status = st.empty()
+        results_area = st.empty()
 
-        # Fetch from Yahoo
-        try:
-            sector, industry = fetch_sector_industry(yf_sym)
-        except Exception as e:
-            sector, industry = (None, None)
+        processed = 0
+        errors = 0
+        for k, idx in enumerate(work_indices, start=1):
+            sym = str(df.at[idx, ticker_col_name]).strip()
+            exch = str(df.at[idx, exchange_col_name]).strip() if exchange_col_name in df.columns else None
+            yf_sym = map_to_yahoo_symbol(sym, exch)
 
-        # Save into df and cache
-        df.at[idx, "Sector (YF)"] = sector
-        df.at[idx, "Industry (YF)"] = industry
-        cache[cache_key] = {"sector": sector, "industry": industry}
+            res = fetch_with_retry(yf_sym)
+            sector = res.get("sector")
+            industry = res.get("industry")
 
-        done += 1
-        # progress & throttling
-        if REQUEST_DELAY_SEC and REQUEST_DELAY_SEC > 0:
+            if sector: df.at[idx, sector_col_name] = sector
+            if industry: df.at[idx, industry_col_name] = industry
+            if not sector and not industry:
+                errors += 1
+
+            processed += 1
+            progress.progress(int(100 * processed / len(work_indices)))
+            status.write(f"Processing {k}/{len(work_indices)} • {sym} → {yf_sym} • "
+                         f"Sector='{sector}' Industry='{industry}'")
+
+            # polite throttle
             time.sleep(REQUEST_DELAY_SEC)
-        if done % 50 == 0:
-            print(f"Processed {done}/{total}… saving cache.")
-            save_cache(CACHE_JSON, cache)
 
-    # Final save
-    save_cache(CACHE_JSON, cache)
+            if k % 50 == 0:
+                results_area.info(f"Checkpoint: processed {k} rows…")
 
-    # Keep your original columns order; append YF columns at the end (or move them next to Symbol)
-    # If you prefer them next to the ticker, uncomment the block below:
-    # cols = list(df.columns)
-    # for col in ["Sector (YF)", "Industry (YF)"]:
-    #     cols.remove(col)
-    # insert_at = max(0, cols.index(TICKER_COL) + 1) if TICKER_COL in cols else len(cols)
-    # cols[insert_at:insert_at] = ["Sector (YF)", "Industry (YF)"]
-    # df = df[cols]
+        st.success(f"Done. Processed {processed} rows. Empty results: {errors}")
 
-    # Write output
-    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
+        # Show a small sample and enable download
+        st.subheader("Sample of Updated Data")
+        st.dataframe(df.head(50), use_container_width=True)
 
-    print(f"Done. Wrote: {OUTPUT_XLSX}")
-    print(f"Cache: {CACHE_JSON}")
+        # Prepare Excel download
+        out_buf = io.BytesIO()
+        with pd.ExcelWriter(out_buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False)
+        out_buf.seek(0)
+        st.download_button(
+            label="⬇️ Download updated Excel",
+            data=out_buf,
+            file_name="with_yf_sectors.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-if __name__ == "__main__":
-    main()
+    elif start and not work_indices:
+        st.info("Nothing to do: no rows need filling (or outputs already filled).")
+else:
+    st.info("Upload your Excel to begin.")
