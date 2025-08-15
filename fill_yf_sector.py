@@ -1,3 +1,4 @@
+# fill_yf_sector.py
 import io
 import re
 import time
@@ -50,11 +51,17 @@ if uploaded:
         st.error(f"Column '{ticker_col_name}' not found. Available: {list(df.columns)}")
         st.stop()
 
-    # Ensure output columns exist
+    # Ensure output columns exist (additions: Name, Country, Asset_Type)
     if sector_col_name not in df.columns:
         df[sector_col_name] = None
     if industry_col_name not in df.columns:
         df[industry_col_name] = None
+    if "Name" not in df.columns:
+        df["Name"] = None
+    if "Country" not in df.columns:
+        df["Country"] = None
+    if "Asset_Type" not in df.columns:
+        df["Asset_Type"] = None
 
     with st.expander("Preview uploaded data"):
         st.dataframe(df.head(20), use_container_width=True)
@@ -94,7 +101,8 @@ if uploaded:
     @st.cache_data(ttl=60*60*24, show_spinner=False)
     def cached_get_info(yf_symbol):
         """
-        Cached metadata fetch. Returns dict {'sector':..., 'industry':...}.
+        Cached metadata fetch.
+        Returns dict with: sector, industry, name, country, asset_type.
         Returns {} on failure; never raises.
         """
         try:
@@ -109,11 +117,27 @@ if uploaded:
                     info = {}
             if not isinstance(info, dict):
                 return {}
+
             sector = info.get("sector")
             industry = info.get("industry") or info.get("industryKey") or info.get("industryDisp")
+            name = info.get("shortName") or info.get("longName")
+            country = info.get("country")
+            asset_type = info.get("quoteType")
+
+            # Normalize/clean
             sector = sector if sector and str(sector).strip() else None
             industry = industry if industry and str(industry).strip() else None
-            return {"sector": sector, "industry": industry}
+            name = name if name and str(name).strip() else None
+            country = country if country and str(country).strip() else None
+            asset_type = asset_type if asset_type and str(asset_type).strip() else None
+
+            return {
+                "sector": sector,
+                "industry": industry,
+                "name": name,
+                "country": country,
+                "asset_type": asset_type,
+            }
         except Exception:
             return {}
 
@@ -162,7 +186,7 @@ if uploaded:
         except Exception:
             return True
 
-    # Build worklist
+    # Build worklist (skip logic still based on Sector & Industry to keep behavior stable)
     work_indices = []
     for i, row in df.iterrows():
         sym = str(row.get(ticker_col_name, "")).strip()
@@ -201,7 +225,12 @@ if uploaded:
                 if do_exists_check:
                     st.write(f"Exists check: **{cached_exists(mapped)}**")
                 meta = cached_get_info(mapped)
-                st.write(f"Sector: **{meta.get('sector')}**, Industry: **{meta.get('industry')}**")
+                st.write(
+                    f"Name: **{meta.get('name')}** • Country: **{meta.get('country')}** • Type: **{meta.get('asset_type')}**"
+                )
+                st.write(
+                    f"Sector: **{meta.get('sector')}**, Industry: **{meta.get('industry')}**"
+                )
 
     colA, colB = st.columns([1,1])
     start = colA.button("▶️ Start Filling from Yahoo")
@@ -226,7 +255,12 @@ if uploaded:
             # Optional quick existence check (fails open; rarely returns False)
             if do_exists_check and not cached_exists(yf_sym):
                 failures += 1
-                err_rows.append({"Symbol": sym, "Mapped": yf_sym, "Status": "not_found", "Sector": None, "Industry": None, "Error": "existence_check_failed"})
+                err_rows.append({
+                    "Symbol": sym, "Mapped": yf_sym, "Status": "not_found",
+                    "Sector": None, "Industry": None,
+                    "Name": None, "Country": None, "Asset_Type": None,
+                    "Error": "existence_check_failed"
+                })
                 status.write(f"❌ {k}/{len(work_indices)} • {sym} → {yf_sym} • not found (pre-check)")
                 if k % int(checkpoint_every) == 0:
                     save_checkpoint(df)
@@ -241,7 +275,7 @@ if uploaded:
             for attempt in range(int(max_retries) + 1):
                 try:
                     result = cached_get_info(yf_sym)
-                    if result.get("sector") or result.get("industry"):
+                    if any(result.get(x) for x in ("sector","industry","name","country","asset_type")):
                         break
                 except Exception as e:
                     last_err_msg = str(e)
@@ -249,25 +283,47 @@ if uploaded:
 
             sector = result.get("sector")
             industry = result.get("industry")
+            name = result.get("name")
+            country = result.get("country")
+            asset_type = result.get("asset_type")
 
             # Assign only explicit strings to avoid FutureWarnings
             if isinstance(sector, str) and sector.strip():
                 df.at[idx, sector_col_name] = sector.strip()
             if isinstance(industry, str) and industry.strip():
                 df.at[idx, industry_col_name] = industry.strip()
+            if isinstance(name, str) and name.strip():
+                df.at[idx, "Name"] = name.strip()
+            if isinstance(country, str) and country.strip():
+                df.at[idx, "Country"] = country.strip()
+            if isinstance(asset_type, str) and asset_type.strip():
+                df.at[idx, "Asset_Type"] = asset_type.strip()
 
-            ok = bool((isinstance(sector, str) and sector.strip()) or (isinstance(industry, str) and industry.strip()))
+            ok = bool(
+                (isinstance(sector, str) and sector.strip()) or
+                (isinstance(industry, str) and industry.strip()) or
+                (isinstance(name, str) and name.strip()) or
+                (isinstance(country, str) and country.strip()) or
+                (isinstance(asset_type, str) and asset_type.strip())
+            )
+
             if not ok:
                 failures += 1
                 err_rows.append({
                     "Symbol": sym, "Mapped": yf_sym, "Status": "empty",
-                    "Sector": sector, "Industry": industry, "Error": last_err_msg
+                    "Sector": sector, "Industry": industry,
+                    "Name": name, "Country": country, "Asset_Type": asset_type,
+                    "Error": last_err_msg
                 })
 
             processed += 1
             progress.progress(int(100 * processed / len(work_indices)))
             prefix = "✅" if ok else "⚠️"
-            status.write(f"{prefix} {k}/{len(work_indices)} • {sym} → {yf_sym} • Sector='{sector}' Industry='{industry}'")
+            status.write(
+                f"{prefix} {k}/{len(work_indices)} • {sym} → {yf_sym} • "
+                f"Name='{name}' Country='{country}' Type='{asset_type}' • "
+                f"Sector='{sector}' Industry='{industry}'"
+            )
 
             time.sleep(request_delay)
 
