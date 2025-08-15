@@ -16,6 +16,7 @@ DEFAULT_EXCHANGE_COL = "Exchange"         # input column (optional, helps mappin
 DEFAULT_SECTOR_COL = "Sector (YF)"        # output
 DEFAULT_INDUSTRY_COL = "Industry (YF)"    # output
 DEFAULT_EXCHANGE_OUT_COL = "Exchange (YF)"# output (new)
+MAX_SHEET_ROWS_HARD_CAP = 500             # absolute maximum per requirement
 # ----------------------------
 
 st.set_page_config(page_title="Fill Sector/Industry from Yahoo Finance", layout="wide")
@@ -26,6 +27,7 @@ with st.sidebar:
     # Inputs
     ticker_col_name = st.text_input("Ticker column name", value=DEFAULT_TICKER_COL)
     exchange_col_name = st.text_input("Input column: Exchange (optional, helps mapping US vs non-US)", value=DEFAULT_EXCHANGE_COL)
+
     # Outputs
     sector_col_name = st.text_input("Output column: Sector", value=DEFAULT_SECTOR_COL)
     industry_col_name = st.text_input("Output column: Industry", value=DEFAULT_INDUSTRY_COL)
@@ -36,12 +38,32 @@ with st.sidebar:
     max_retries = st.number_input("Max retries per ticker", value=1, step=1, min_value=0)
     checkpoint_every = st.number_input("Checkpoint save every N rows", value=50, step=10, min_value=10)
     do_exists_check = st.checkbox("Pre-check ticker exists (use only for cleanup)", value=False)
+
+    st.markdown("---")
+    user_sheet_rows = st.number_input("Max rows per sheet (≤ 500)", value=500, step=50, min_value=100, max_value=500)
+    max_rows_per_sheet = min(int(user_sheet_rows), MAX_SHEET_ROWS_HARD_CAP)
     st.caption("Tip: Increase delay if you hit Yahoo rate limits.")
 
 uploaded = st.file_uploader("Upload your Excel file", type=["xlsx"])
 sheet_name = None
 
 logging.getLogger("yfinance").setLevel(logging.ERROR)
+
+def write_df_paged(_df: pd.DataFrame, writer, page_size: int = 500):
+    """
+    Write DataFrame across multiple sheets, each with up to `page_size` rows.
+    Sheets are named Data_1, Data_2, ...
+    """
+    n = len(_df)
+    if n == 0:
+        _df.to_excel(writer, index=False, sheet_name="Data_1")
+        return
+    pages = (n + page_size - 1) // page_size
+    for p in range(pages):
+        start = p * page_size
+        end = min(start + page_size, n)
+        sheet = f"Data_{p+1}"
+        _df.iloc[start:end].to_excel(writer, index=False, sheet_name=sheet)
 
 if uploaded:
     try:
@@ -56,7 +78,7 @@ if uploaded:
         st.error(f"Column '{ticker_col_name}' not found. Available: {list(df.columns)}")
         st.stop()
 
-    # Ensure output columns exist (additions: Name, Country, Asset_Type, Exchange(YF))
+    # Ensure output columns exist (Name, Country, Asset_Type, Exchange(YF))
     if sector_col_name not in df.columns:
         df[sector_col_name] = None
     if industry_col_name not in df.columns:
@@ -220,7 +242,7 @@ if uploaded:
     def save_checkpoint(_df: pd.DataFrame):
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            _df.to_excel(writer, index=False)
+            write_df_paged(_df, writer, page_size=max_rows_per_sheet)
         buf.seek(0)
         st.session_state.partial_bytes = buf.getvalue()
 
@@ -269,7 +291,7 @@ if uploaded:
                 err_rows.append({
                     "Symbol": sym, "Mapped": yf_sym, "Status": "not_found",
                     "Sector": None, "Industry": None,
-                    "Name": None, "Country": None, "Asset_Type": None, "Exchange (YF)": None,
+                    "Name": None, "Country": None, "Asset_Type": None, exchange_out_col_name: None,
                     "Error": "existence_check_failed"
                 })
                 status.write(f"❌ {k}/{len(work_indices)} • {sym} → {yf_sym} • not found (pre-check)")
@@ -347,7 +369,7 @@ if uploaded:
                 save_checkpoint(df)
                 st.info(f"Checkpoint saved at {k} rows.")
 
-        # Final checkpoint
+        # Final checkpoint (multi-sheet)
         save_checkpoint(df)
         st.success(f"Done. Processed {processed} rows. Empty/failed: {failures}")
 
@@ -371,7 +393,7 @@ if uploaded:
 
         if st.session_state.partial_bytes:
             st.download_button(
-                label="⬇️ Download updated Excel",
+                label=f"⬇️ Download updated Excel (paged ≤ {max_rows_per_sheet}/sheet)",
                 data=st.session_state.partial_bytes,
                 file_name="with_yf_sectors.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
