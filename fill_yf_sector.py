@@ -12,9 +12,10 @@ KNOWN_EX_SUFFIXES = {
     ".ST",".HE",".MI",".AS",".MC",".WA",".VI",".IR",".IS",".HK",".KS",".KQ",".T",".TW"
 }
 DEFAULT_TICKER_COL = "Symbol"
-DEFAULT_EXCHANGE_COL = "Exchange"
-DEFAULT_SECTOR_COL = "Sector (YF)"
-DEFAULT_INDUSTRY_COL = "Industry (YF)"
+DEFAULT_EXCHANGE_COL = "Exchange"         # input column (optional, helps mapping)
+DEFAULT_SECTOR_COL = "Sector (YF)"        # output
+DEFAULT_INDUSTRY_COL = "Industry (YF)"    # output
+DEFAULT_EXCHANGE_OUT_COL = "Exchange (YF)"# output (new)
 # ----------------------------
 
 st.set_page_config(page_title="Fill Sector/Industry from Yahoo Finance", layout="wide")
@@ -22,11 +23,15 @@ st.title("📊 Fill Sector/Industry from Yahoo Finance")
 
 with st.sidebar:
     st.header("Settings")
+    # Inputs
     ticker_col_name = st.text_input("Ticker column name", value=DEFAULT_TICKER_COL)
-    exchange_col_name = st.text_input("Exchange column (optional)", value=DEFAULT_EXCHANGE_COL)
+    exchange_col_name = st.text_input("Input column: Exchange (optional, helps mapping US vs non-US)", value=DEFAULT_EXCHANGE_COL)
+    # Outputs
     sector_col_name = st.text_input("Output column: Sector", value=DEFAULT_SECTOR_COL)
     industry_col_name = st.text_input("Output column: Industry", value=DEFAULT_INDUSTRY_COL)
-    skip_filled = st.checkbox("Skip rows already filled (both columns)", value=True)
+    exchange_out_col_name = st.text_input("Output column: Exchange", value=DEFAULT_EXCHANGE_OUT_COL)
+
+    skip_filled = st.checkbox("Skip rows already filled (Sector & Industry both present)", value=True)
     request_delay = st.number_input("Delay per request (seconds)", value=0.7, step=0.1, min_value=0.0)
     max_retries = st.number_input("Max retries per ticker", value=1, step=1, min_value=0)
     checkpoint_every = st.number_input("Checkpoint save every N rows", value=50, step=10, min_value=10)
@@ -51,7 +56,7 @@ if uploaded:
         st.error(f"Column '{ticker_col_name}' not found. Available: {list(df.columns)}")
         st.stop()
 
-    # Ensure output columns exist (additions: Name, Country, Asset_Type)
+    # Ensure output columns exist (additions: Name, Country, Asset_Type, Exchange(YF))
     if sector_col_name not in df.columns:
         df[sector_col_name] = None
     if industry_col_name not in df.columns:
@@ -62,6 +67,8 @@ if uploaded:
         df["Country"] = None
     if "Asset_Type" not in df.columns:
         df["Asset_Type"] = None
+    if exchange_out_col_name not in df.columns:
+        df[exchange_out_col_name] = None
 
     with st.expander("Preview uploaded data"):
         st.dataframe(df.head(20), use_container_width=True)
@@ -89,7 +96,7 @@ if uploaded:
             ex = str(exchange).strip().upper()
             if any(k in ex for k in ("NYSE", "NASDAQ", "NSDQ", "OTC", "ARCA", "BATS", "AMEX", "NYSEMKT", "NMS")):
                 is_us = True
-        if exchange in (None, "", "nan") and class_share_pat.match(sym):
+        if (exchange in (None, "", "nan")) and class_share_pat.match(sym):
             is_us = True
 
         if is_us and "." in sym:
@@ -102,7 +109,7 @@ if uploaded:
     def cached_get_info(yf_symbol):
         """
         Cached metadata fetch.
-        Returns dict with: sector, industry, name, country, asset_type.
+        Returns dict with: sector, industry, name, country, asset_type, exchange.
         Returns {} on failure; never raises.
         """
         try:
@@ -123,6 +130,7 @@ if uploaded:
             name = info.get("shortName") or info.get("longName")
             country = info.get("country")
             asset_type = info.get("quoteType")
+            exchange_yf = info.get("exchange") or info.get("market")
 
             # Normalize/clean
             sector = sector if sector and str(sector).strip() else None
@@ -130,6 +138,7 @@ if uploaded:
             name = name if name and str(name).strip() else None
             country = country if country and str(country).strip() else None
             asset_type = asset_type if asset_type and str(asset_type).strip() else None
+            exchange_yf = exchange_yf if exchange_yf and str(exchange_yf).strip() else None
 
             return {
                 "sector": sector,
@@ -137,6 +146,7 @@ if uploaded:
                 "name": name,
                 "country": country,
                 "asset_type": asset_type,
+                "exchange": exchange_yf,
             }
         except Exception:
             return {}
@@ -217,7 +227,7 @@ if uploaded:
     # Optional: single-ticker tester
     with st.expander("🔎 Single-Ticker Tester"):
         test_sym = st.text_input("Symbol (e.g., BRK.B, SHOP.TO, AI)", "")
-        test_ex = st.text_input("Exchange (optional, helps for US vs non-US)", "")
+        test_ex = st.text_input("Input Exchange (optional, helps US vs non-US mapping)", "")
         if st.button("Test mapping & fetch", use_container_width=False):
             if test_sym:
                 mapped = map_to_yahoo_symbol(test_sym, test_ex)
@@ -226,7 +236,8 @@ if uploaded:
                     st.write(f"Exists check: **{cached_exists(mapped)}**")
                 meta = cached_get_info(mapped)
                 st.write(
-                    f"Name: **{meta.get('name')}** • Country: **{meta.get('country')}** • Type: **{meta.get('asset_type')}**"
+                    f"Name: **{meta.get('name')}** • Country: **{meta.get('country')}** • "
+                    f"Type: **{meta.get('asset_type')}** • Exchange: **{meta.get('exchange')}**"
                 )
                 st.write(
                     f"Sector: **{meta.get('sector')}**, Industry: **{meta.get('industry')}**"
@@ -249,8 +260,8 @@ if uploaded:
 
         for k, idx in enumerate(work_indices, start=1):
             sym = str(df.at[idx, ticker_col_name]).strip()
-            exch = str(df.at[idx, exchange_col_name]).strip() if exchange_col_name in df.columns else None
-            yf_sym = map_to_yahoo_symbol(sym, exch)
+            exch_in = str(df.at[idx, exchange_col_name]).strip() if exchange_col_name in df.columns else None
+            yf_sym = map_to_yahoo_symbol(sym, exch_in)
 
             # Optional quick existence check (fails open; rarely returns False)
             if do_exists_check and not cached_exists(yf_sym):
@@ -258,7 +269,7 @@ if uploaded:
                 err_rows.append({
                     "Symbol": sym, "Mapped": yf_sym, "Status": "not_found",
                     "Sector": None, "Industry": None,
-                    "Name": None, "Country": None, "Asset_Type": None,
+                    "Name": None, "Country": None, "Asset_Type": None, "Exchange (YF)": None,
                     "Error": "existence_check_failed"
                 })
                 status.write(f"❌ {k}/{len(work_indices)} • {sym} → {yf_sym} • not found (pre-check)")
@@ -275,7 +286,7 @@ if uploaded:
             for attempt in range(int(max_retries) + 1):
                 try:
                     result = cached_get_info(yf_sym)
-                    if any(result.get(x) for x in ("sector","industry","name","country","asset_type")):
+                    if any(result.get(x) for x in ("sector","industry","name","country","asset_type","exchange")):
                         break
                 except Exception as e:
                     last_err_msg = str(e)
@@ -286,6 +297,7 @@ if uploaded:
             name = result.get("name")
             country = result.get("country")
             asset_type = result.get("asset_type")
+            exchange_yf = result.get("exchange")
 
             # Assign only explicit strings to avoid FutureWarnings
             if isinstance(sector, str) and sector.strip():
@@ -298,13 +310,16 @@ if uploaded:
                 df.at[idx, "Country"] = country.strip()
             if isinstance(asset_type, str) and asset_type.strip():
                 df.at[idx, "Asset_Type"] = asset_type.strip()
+            if isinstance(exchange_yf, str) and exchange_yf.strip():
+                df.at[idx, exchange_out_col_name] = exchange_yf.strip()
 
             ok = bool(
                 (isinstance(sector, str) and sector.strip()) or
                 (isinstance(industry, str) and industry.strip()) or
                 (isinstance(name, str) and name.strip()) or
                 (isinstance(country, str) and country.strip()) or
-                (isinstance(asset_type, str) and asset_type.strip())
+                (isinstance(asset_type, str) and asset_type.strip()) or
+                (isinstance(exchange_yf, str) and exchange_yf.strip())
             )
 
             if not ok:
@@ -312,7 +327,7 @@ if uploaded:
                 err_rows.append({
                     "Symbol": sym, "Mapped": yf_sym, "Status": "empty",
                     "Sector": sector, "Industry": industry,
-                    "Name": name, "Country": country, "Asset_Type": asset_type,
+                    "Name": name, "Country": country, "Asset_Type": asset_type, exchange_out_col_name: exchange_yf,
                     "Error": last_err_msg
                 })
 
@@ -321,7 +336,7 @@ if uploaded:
             prefix = "✅" if ok else "⚠️"
             status.write(
                 f"{prefix} {k}/{len(work_indices)} • {sym} → {yf_sym} • "
-                f"Name='{name}' Country='{country}' Type='{asset_type}' • "
+                f"Name='{name}' Country='{country}' Type='{asset_type}' {exchange_out_col_name}='{exchange_yf}' • "
                 f"Sector='{sector}' Industry='{industry}'"
             )
 
