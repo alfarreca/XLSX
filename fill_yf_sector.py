@@ -2,7 +2,9 @@
 import io
 import re
 import time
+import math
 import logging
+import random
 import pandas as pd
 import streamlit as st
 
@@ -12,11 +14,11 @@ KNOWN_EX_SUFFIXES = {
     ".ST",".HE",".MI",".AS",".MC",".WA",".VI",".IR",".IS",".HK",".KS",".KQ",".T",".TW"
 }
 DEFAULT_TICKER_COL = "Symbol"
-DEFAULT_EXCHANGE_COL = "Exchange"         # input column (optional, helps mapping)
-DEFAULT_SECTOR_COL = "Sector (YF)"        # output
-DEFAULT_INDUSTRY_COL = "Industry (YF)"    # output
-DEFAULT_EXCHANGE_OUT_COL = "Exchange (YF)"# output (new)
-MAX_SHEET_ROWS_HARD_CAP = 500             # absolute maximum per requirement
+DEFAULT_EXCHANGE_COL = "Exchange"          # input column (optional, helps mapping)
+DEFAULT_SECTOR_COL = "Sector (YF)"         # output
+DEFAULT_INDUSTRY_COL = "Industry (YF)"     # output
+DEFAULT_EXCHANGE_OUT_COL = "Exchange (YF)" # output (new)
+MAX_SHEET_ROWS_HARD_CAP = 500
 # ----------------------------
 
 st.set_page_config(page_title="Fill Sector/Industry from Yahoo Finance", layout="wide")
@@ -34,7 +36,7 @@ with st.sidebar:
     exchange_out_col_name = st.text_input("Output column: Exchange", value=DEFAULT_EXCHANGE_OUT_COL)
 
     skip_filled = st.checkbox("Skip rows already filled (Sector & Industry both present)", value=True)
-    request_delay = st.number_input("Delay per request (seconds)", value=0.7, step=0.1, min_value=0.0)
+    request_delay = st.number_input("Delay per request (seconds)", value=0.70, step=0.1, min_value=0.0)
     max_retries = st.number_input("Max retries per ticker", value=1, step=1, min_value=0)
     checkpoint_every = st.number_input("Checkpoint save every N rows", value=50, step=10, min_value=10)
     do_exists_check = st.checkbox("Pre-check ticker exists (use only for cleanup)", value=False)
@@ -42,7 +44,11 @@ with st.sidebar:
     st.markdown("---")
     user_sheet_rows = st.number_input("Max rows per sheet (≤ 500)", value=500, step=50, min_value=100, max_value=500)
     max_rows_per_sheet = min(int(user_sheet_rows), MAX_SHEET_ROWS_HARD_CAP)
-    st.caption("Tip: Increase delay if you hit Yahoo rate limits.")
+
+    # Anti-burst
+    jitter_pct = st.slider("Jitter ±% around delay (reduces burst 404s)", min_value=0, max_value=30, value=10)
+
+    st.caption("Tip: If you see 404 spam, increase delay and/or enable jitter.")
 
 uploaded = st.file_uploader("Upload your Excel file", type=["xlsx"])
 sheet_name = None
@@ -50,10 +56,7 @@ sheet_name = None
 logging.getLogger("yfinance").setLevel(logging.ERROR)
 
 def write_df_paged(_df: pd.DataFrame, writer, page_size: int = 500):
-    """
-    Write DataFrame across multiple sheets, each with up to `page_size` rows.
-    Sheets are named Data_1, Data_2, ...
-    """
+    """Write DataFrame across multiple sheets, each with up to `page_size` rows."""
     n = len(_df)
     if n == 0:
         _df.to_excel(writer, index=False, sheet_name="Data_1")
@@ -64,6 +67,19 @@ def write_df_paged(_df: pd.DataFrame, writer, page_size: int = 500):
         end = min(start + page_size, n)
         sheet = f"Data_{p+1}"
         _df.iloc[start:end].to_excel(writer, index=False, sheet_name=sheet)
+
+def ensure_string_cols(df: pd.DataFrame, cols):
+    """Force columns to pandas 'string' dtype to avoid dtype warnings on assignment."""
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.Series(dtype="string")
+        # If column exists but is not string, cast safely
+        if pd.api.types.infer_dtype(df[c], skipna=True) != "string":
+            try:
+                df[c] = df[c].astype("string")
+            except Exception:
+                # Last resort: to object
+                df[c] = df[c].astype(object)
 
 if uploaded:
     try:
@@ -78,19 +94,11 @@ if uploaded:
         st.error(f"Column '{ticker_col_name}' not found. Available: {list(df.columns)}")
         st.stop()
 
-    # Ensure output columns exist (Name, Country, Asset_Type, Exchange(YF))
-    if sector_col_name not in df.columns:
-        df[sector_col_name] = None
-    if industry_col_name not in df.columns:
-        df[industry_col_name] = None
-    if "Name" not in df.columns:
-        df["Name"] = None
-    if "Country" not in df.columns:
-        df["Country"] = None
-    if "Asset_Type" not in df.columns:
-        df["Asset_Type"] = None
-    if exchange_out_col_name not in df.columns:
-        df[exchange_out_col_name] = None
+    # Ensure output columns exist and are STRING dtype (prevents FutureWarning)
+    for col in [sector_col_name, industry_col_name, "Name", "Country", "Asset_Type", exchange_out_col_name]:
+        if col not in df.columns:
+            df[col] = pd.Series(dtype="string")
+    ensure_string_cols(df, [sector_col_name, industry_col_name, "Name", "Country", "Asset_Type", exchange_out_col_name])
 
     with st.expander("Preview uploaded data"):
         st.dataframe(df.head(20), use_container_width=True)
@@ -98,6 +106,7 @@ if uploaded:
     # Lazy import yfinance so UI renders even if missing
     try:
         import yfinance as yf
+        from urllib.error import HTTPError
     except Exception:
         st.error("`yfinance` is not installed. Add to requirements.txt:\n\n`yfinance>=0.2.40`")
         st.stop()
@@ -130,61 +139,81 @@ if uploaded:
     @st.cache_data(ttl=60*60*24, show_spinner=False)
     def cached_get_info(yf_symbol):
         """
-        Cached metadata fetch.
-        Returns dict with: sector, industry, name, country, asset_type, exchange.
-        Returns {} on failure; never raises.
+        Cached metadata fetch with layered fallbacks and 404 suppression.
+        Returns dict: sector, industry, name, country, asset_type, exchange.
         """
         try:
             t = yf.Ticker(yf_symbol)
+
             info = {}
+            # 1) Preferred: get_info (new API)
             try:
                 info = t.get_info()
-            except Exception:
-                try:
-                    info = getattr(t, "info", {}) or {}
-                except Exception:
+                if not isinstance(info, dict):
                     info = {}
-            if not isinstance(info, dict):
-                return {}
+            except HTTPError as he:
+                # Ignore noisy 404s from Yahoo endpoints
+                if getattr(he, "code", None) != 404:
+                    raise
+                info = {}
+            except Exception:
+                info = {}
 
-            sector = info.get("sector")
+            # 2) Legacy property .info as fallback
+            if not info:
+                try:
+                    maybe = getattr(t, "info", {}) or {}
+                    if isinstance(maybe, dict):
+                        info = maybe
+                except Exception:
+                    pass
+
+            # Extract from info if available
+            sector   = info.get("sector")
             industry = info.get("industry") or info.get("industryKey") or info.get("industryDisp")
-            name = info.get("shortName") or info.get("longName")
-            country = info.get("country")
-            asset_type = info.get("quoteType")
-            exchange_yf = info.get("exchange") or info.get("market")
+            name     = info.get("shortName") or info.get("longName")
+            country  = info.get("country")
+            asset_tp = info.get("quoteType")
+            exch_yf  = info.get("exchange") or info.get("market")
+
+            # 3) fast_info supplement
+            fi = getattr(t, "fast_info", None)
+            try:
+                if fi and not exch_yf:
+                    exch_yf = getattr(fi, "market", None)
+            except Exception:
+                pass
+
+            # 4) Light history ping to validate existence (no need to parse values)
+            if not any([sector, industry, name, country, asset_tp, exch_yf]):
+                try:
+                    hist = t.history(period="5d", interval="1d", auto_adjust=False)
+                    if hist is not None and not hist.empty:
+                        # If we reached here, set at least exchange if fast_info has it
+                        if fi and not exch_yf:
+                            exch_yf = getattr(fi, "market", None)
+                except Exception:
+                    pass
 
             # Normalize/clean
-            sector = sector if sector and str(sector).strip() else None
-            industry = industry if industry and str(industry).strip() else None
-            name = name if name and str(name).strip() else None
-            country = country if country and str(country).strip() else None
-            asset_type = asset_type if asset_type and str(asset_type).strip() else None
-            exchange_yf = exchange_yf if exchange_yf and str(exchange_yf).strip() else None
-
+            norm = lambda x: x if (x is not None and str(x).strip()) else None
             return {
-                "sector": sector,
-                "industry": industry,
-                "name": name,
-                "country": country,
-                "asset_type": asset_type,
-                "exchange": exchange_yf,
+                "sector":   norm(sector),
+                "industry": norm(industry),
+                "name":     norm(name),
+                "country":  norm(country),
+                "asset_type": norm(asset_tp),
+                "exchange": norm(exch_yf),
             }
         except Exception:
             return {}
 
     @st.cache_data(ttl=60*60*24, show_spinner=False)
     def cached_exists(yf_symbol):
-        """
-        Conservative existence check that FAILS OPEN.
-        Only returns False if we can clearly confirm non-existence across methods.
-        Otherwise returns True to avoid false negatives on Streamlit Cloud.
-        """
+        """Conservative existence check that FAILS OPEN."""
         import yfinance as yf
         try:
             t = yf.Ticker(yf_symbol)
-
-            # 1) get_info has some basic keys for live symbols
             try:
                 info = t.get_info()
                 if isinstance(info, dict) and (
@@ -193,32 +222,23 @@ if uploaded:
                     return True
             except Exception:
                 pass
-
-            # 2) recent history
             try:
                 hist = t.history(period="5d", interval="1d", auto_adjust=False)
                 if hist is not None and not hist.empty:
                     return True
             except Exception:
                 pass
-
-            # 3) fast_info (use only to confirm, never to deny)
             fi = getattr(t, "fast_info", None)
             try:
-                if fi:
-                    last_price = getattr(fi, "last_price", None)
-                    market = getattr(fi, "market", None)
-                    if last_price is not None or market is not None:
-                        return True
+                if fi and (getattr(fi, "last_price", None) is not None or getattr(fi, "market", None) is not None):
+                    return True
             except Exception:
                 pass
-
-            # Could not confirm either way → fail open
             return True
         except Exception:
             return True
 
-    # Build worklist (skip logic still based on Sector & Industry to keep behavior stable)
+    # Build worklist (skip logic: both sector & industry already present)
     work_indices = []
     for i, row in df.iterrows():
         sym = str(row.get(ticker_col_name, "")).strip()
@@ -273,6 +293,14 @@ if uploaded:
         st.session_state.partial_bytes = None
         st.info("Logs and checkpoint cleared.")
 
+    def sleep_with_jitter(base, pct):
+        if base <= 0 or pct <= 0:
+            time.sleep(max(base, 0))
+            return
+        delta = base * (pct / 100.0)
+        wait = base + random.uniform(-delta, delta)
+        time.sleep(max(wait, 0))
+
     if start and work_indices:
         progress = st.progress(0)
         status = st.empty()
@@ -290,19 +318,18 @@ if uploaded:
                 failures += 1
                 err_rows.append({
                     "Symbol": sym, "Mapped": yf_sym, "Status": "not_found",
-                    "Sector": None, "Industry": None,
-                    "Name": None, "Country": None, "Asset_Type": None, exchange_out_col_name: None,
-                    "Error": "existence_check_failed"
+                    "Sector": None, "Industry": None, "Name": None, "Country": None, "Asset_Type": None,
+                    exchange_out_col_name: None, "Error": "existence_check_failed"
                 })
                 status.write(f"❌ {k}/{len(work_indices)} • {sym} → {yf_sym} • not found (pre-check)")
                 if k % int(checkpoint_every) == 0:
                     save_checkpoint(df)
                 processed += 1
                 progress.progress(int(100 * processed / len(work_indices)))
-                time.sleep(request_delay)
+                sleep_with_jitter(request_delay, jitter_pct)
                 continue
 
-            # Fetch with retries
+            # Fetch with retries (exponential backoff + jitter)
             last_err_msg = None
             result = {}
             for attempt in range(int(max_retries) + 1):
@@ -312,16 +339,16 @@ if uploaded:
                         break
                 except Exception as e:
                     last_err_msg = str(e)
+                # backoff (0.4s base like before, grows per attempt)
                 time.sleep(0.4 * (attempt + 1))
-
-            sector = result.get("sector")
-            industry = result.get("industry")
-            name = result.get("name")
-            country = result.get("country")
-            asset_type = result.get("asset_type")
+            sector      = result.get("sector")
+            industry    = result.get("industry")
+            name        = result.get("name")
+            country     = result.get("country")
+            asset_type  = result.get("asset_type")
             exchange_yf = result.get("exchange")
 
-            # Assign only explicit strings to avoid FutureWarnings
+            # Assign (columns already string dtype)
             if isinstance(sector, str) and sector.strip():
                 df.at[idx, sector_col_name] = sector.strip()
             if isinstance(industry, str) and industry.strip():
@@ -335,21 +362,21 @@ if uploaded:
             if isinstance(exchange_yf, str) and exchange_yf.strip():
                 df.at[idx, exchange_out_col_name] = exchange_yf.strip()
 
-            ok = bool(
-                (isinstance(sector, str) and sector.strip()) or
-                (isinstance(industry, str) and industry.strip()) or
-                (isinstance(name, str) and name.strip()) or
-                (isinstance(country, str) and country.strip()) or
-                (isinstance(asset_type, str) and asset_type.strip()) or
-                (isinstance(exchange_yf, str) and exchange_yf.strip())
-            )
+            ok = any([
+                isinstance(sector, str) and sector.strip(),
+                isinstance(industry, str) and industry.strip(),
+                isinstance(name, str) and name.strip(),
+                isinstance(country, str) and country.strip(),
+                isinstance(asset_type, str) and asset_type.strip(),
+                isinstance(exchange_yf, str) and exchange_yf.strip()
+            ])
 
             if not ok:
                 failures += 1
                 err_rows.append({
                     "Symbol": sym, "Mapped": yf_sym, "Status": "empty",
-                    "Sector": sector, "Industry": industry,
-                    "Name": name, "Country": country, "Asset_Type": asset_type, exchange_out_col_name: exchange_yf,
+                    "Sector": sector, "Industry": industry, "Name": name, "Country": country,
+                    "Asset_Type": asset_type, exchange_out_col_name: exchange_yf,
                     "Error": last_err_msg
                 })
 
@@ -362,7 +389,8 @@ if uploaded:
                 f"Sector='{sector}' Industry='{industry}'"
             )
 
-            time.sleep(request_delay)
+            # Delay (with jitter)
+            sleep_with_jitter(request_delay, jitter_pct)
 
             # Checkpoint
             if k % int(checkpoint_every) == 0:
