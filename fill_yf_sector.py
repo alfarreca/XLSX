@@ -5,6 +5,7 @@ import time
 import math
 import logging
 import random
+import string
 import pandas as pd
 import streamlit as st
 
@@ -17,8 +18,9 @@ DEFAULT_TICKER_COL = "Symbol"
 DEFAULT_EXCHANGE_COL = "Exchange"          # input column (optional, helps mapping)
 DEFAULT_SECTOR_COL = "Sector (YF)"         # output
 DEFAULT_INDUSTRY_COL = "Industry (YF)"     # output
-DEFAULT_EXCHANGE_OUT_COL = "Exchange (YF)" # output (new)
+DEFAULT_EXCHANGE_OUT_COL = "Exchange (YF)" # output
 MAX_SHEET_ROWS_HARD_CAP = 500
+VALID_TICKER_CHARS = set(string.ascii_uppercase + string.digits + "._-")
 # ----------------------------
 
 st.set_page_config(page_title="Fill Sector/Industry from Yahoo Finance", layout="wide")
@@ -36,25 +38,29 @@ with st.sidebar:
     exchange_out_col_name = st.text_input("Output column: Exchange", value=DEFAULT_EXCHANGE_OUT_COL)
 
     skip_filled = st.checkbox("Skip rows already filled (Sector & Industry both present)", value=True)
-    request_delay = st.number_input("Delay per request (seconds)", value=0.70, step=0.1, min_value=0.0)
+    request_delay = st.number_input("Delay per request (seconds)", value=1.0, step=0.1, min_value=0.0)
     max_retries = st.number_input("Max retries per ticker", value=1, step=1, min_value=0)
     checkpoint_every = st.number_input("Checkpoint save every N rows", value=50, step=10, min_value=10)
-    do_exists_check = st.checkbox("Pre-check ticker exists (use only for cleanup)", value=False)
+    do_exists_check = st.checkbox("Pre-check ticker exists (legacy fail-open)", value=False)
+
+    st.markdown("### Cleaning")
+    skip_non_yf = st.checkbox("Skip non-Yahoo style symbols (e.g., starting with $ or ending in FUT)", value=True)
+    strict_precheck = st.checkbox("Strict pre-check (skip if no info/history/fast_info)", value=True)
+
+    st.markdown("### Anti-burst")
+    jitter_pct = st.slider("Jitter ±% around delay", min_value=0, max_value=30, value=15)
+    st.caption("If you see 404 spam, increase delay and/or enable jitter.")
 
     st.markdown("---")
     user_sheet_rows = st.number_input("Max rows per sheet (≤ 500)", value=500, step=50, min_value=100, max_value=500)
     max_rows_per_sheet = min(int(user_sheet_rows), MAX_SHEET_ROWS_HARD_CAP)
-
-    # Anti-burst
-    jitter_pct = st.slider("Jitter ±% around delay (reduces burst 404s)", min_value=0, max_value=30, value=10)
-
-    st.caption("Tip: If you see 404 spam, increase delay and/or enable jitter.")
 
 uploaded = st.file_uploader("Upload your Excel file", type=["xlsx"])
 sheet_name = None
 
 logging.getLogger("yfinance").setLevel(logging.ERROR)
 
+# ---------- Helpers ----------
 def write_df_paged(_df: pd.DataFrame, writer, page_size: int = 500):
     """Write DataFrame across multiple sheets, each with up to `page_size` rows."""
     n = len(_df)
@@ -73,14 +79,48 @@ def ensure_string_cols(df: pd.DataFrame, cols):
     for c in cols:
         if c not in df.columns:
             df[c] = pd.Series(dtype="string")
-        # If column exists but is not string, cast safely
         if pd.api.types.infer_dtype(df[c], skipna=True) != "string":
             try:
                 df[c] = df[c].astype("string")
             except Exception:
-                # Last resort: to object
                 df[c] = df[c].astype(object)
 
+def sanitize_symbol(raw: str) -> str:
+    """
+    Strip leading '$' and whitespace, keep only plausible characters, uppercase.
+    Heuristically drop synthetic '$X...' forms that are often screeners' indices.
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip().upper()
+    if s.startswith("$"):
+        s = s[1:]
+    # Heuristic: $XTSLA, $X..., etc. — often synthetic; if very long, drop
+    if s.startswith("X") and not any(s.endswith(suf) for suf in KNOWN_EX_SUFFIXES):
+        if len(s) > 6:
+            return ""
+    s = "".join(ch for ch in s if ch in VALID_TICKER_CHARS)
+    return s
+
+def looks_non_yf(raw: str) -> bool:
+    """
+    Heuristics to catch non-Yahoo synthetics quickly:
+    - empty after sanitize
+    - has colon, slash, or space (e.g., TV format)
+    - FUT placeholders
+    """
+    if not raw:
+        return True
+    r = str(raw).upper()
+    if r.startswith("$"):
+        r = r[1:]
+    if any(x in r for x in [":", "/", " "]):
+        return True
+    if r.endswith("FUT") or r.endswith(".FUT") or r.endswith("_FUT"):
+        return True
+    return sanitize_symbol(r) == ""
+
+# ---------- App ----------
 if uploaded:
     try:
         xl = pd.ExcelFile(uploaded)
@@ -94,11 +134,9 @@ if uploaded:
         st.error(f"Column '{ticker_col_name}' not found. Available: {list(df.columns)}")
         st.stop()
 
-    # Ensure output columns exist and are STRING dtype (prevents FutureWarning)
-    for col in [sector_col_name, industry_col_name, "Name", "Country", "Asset_Type", exchange_out_col_name]:
-        if col not in df.columns:
-            df[col] = pd.Series(dtype="string")
-    ensure_string_cols(df, [sector_col_name, industry_col_name, "Name", "Country", "Asset_Type", exchange_out_col_name])
+    # Ensure output columns exist and are STRING dtype
+    out_cols = [sector_col_name, industry_col_name, "Name", "Country", "Asset_Type", exchange_out_col_name]
+    ensure_string_cols(df, out_cols)
 
     with st.expander("Preview uploaded data"):
         st.dataframe(df.head(20), use_container_width=True)
@@ -115,7 +153,7 @@ if uploaded:
     class_share_pat = re.compile(r"^[A-Z]+\.([A-Z0-9]{1,3})$")
 
     def map_to_yahoo_symbol(symbol, exchange):
-        sym = str(symbol).strip().upper() if symbol is not None else ""
+        sym = sanitize_symbol(symbol)
         if not sym:
             return sym
         for suf in KNOWN_EX_SUFFIXES:
@@ -152,7 +190,6 @@ if uploaded:
                 if not isinstance(info, dict):
                     info = {}
             except HTTPError as he:
-                # Ignore noisy 404s from Yahoo endpoints
                 if getattr(he, "code", None) != 404:
                     raise
                 info = {}
@@ -168,7 +205,6 @@ if uploaded:
                 except Exception:
                     pass
 
-            # Extract from info if available
             sector   = info.get("sector")
             industry = info.get("industry") or info.get("industryKey") or info.get("industryDisp")
             name     = info.get("shortName") or info.get("longName")
@@ -189,29 +225,26 @@ if uploaded:
                 try:
                     hist = t.history(period="5d", interval="1d", auto_adjust=False)
                     if hist is not None and not hist.empty:
-                        # If we reached here, set at least exchange if fast_info has it
                         if fi and not exch_yf:
                             exch_yf = getattr(fi, "market", None)
                 except Exception:
                     pass
 
-            # Normalize/clean
             norm = lambda x: x if (x is not None and str(x).strip()) else None
             return {
-                "sector":   norm(sector),
-                "industry": norm(industry),
-                "name":     norm(name),
-                "country":  norm(country),
+                "sector":     norm(sector),
+                "industry":   norm(industry),
+                "name":       norm(name),
+                "country":    norm(country),
                 "asset_type": norm(asset_tp),
-                "exchange": norm(exch_yf),
+                "exchange":   norm(exch_yf),
             }
         except Exception:
             return {}
 
     @st.cache_data(ttl=60*60*24, show_spinner=False)
     def cached_exists(yf_symbol):
-        """Conservative existence check that FAILS OPEN."""
-        import yfinance as yf
+        """Conservative existence check that FAILS OPEN (rarely returns False)."""
         try:
             t = yf.Ticker(yf_symbol)
             try:
@@ -237,6 +270,33 @@ if uploaded:
             return True
         except Exception:
             return True
+
+    @st.cache_data(ttl=60*60*24, show_spinner=False)
+    def strict_exists(yf_symbol: str) -> bool:
+        """Strict check: True only if info OR history OR fast_info confirms existence."""
+        try:
+            t = yf.Ticker(yf_symbol)
+            try:
+                info = t.get_info()
+                if isinstance(info, dict) and any(info.get(k) for k in ("quoteType","shortName","longName","sector")):
+                    return True
+            except Exception:
+                pass
+            try:
+                hist = t.history(period="5d", interval="1d", auto_adjust=False)
+                if hist is not None and not hist.empty:
+                    return True
+            except Exception:
+                pass
+            fi = getattr(t, "fast_info", None)
+            try:
+                if fi and (getattr(fi, "last_price", None) is not None or getattr(fi, "market", None) is not None):
+                    return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
 
     # Build worklist (skip logic: both sector & industry already present)
     work_indices = []
@@ -281,9 +341,7 @@ if uploaded:
                     f"Name: **{meta.get('name')}** • Country: **{meta.get('country')}** • "
                     f"Type: **{meta.get('asset_type')}** • Exchange: **{meta.get('exchange')}**"
                 )
-                st.write(
-                    f"Sector: **{meta.get('sector')}**, Industry: **{meta.get('industry')}**"
-                )
+                st.write(f"Sector: **{meta.get('sector')}**, Industry: **{meta.get('industry')}**")
 
     colA, colB = st.columns([1,1])
     start = colA.button("▶️ Start Filling from Yahoo")
@@ -309,19 +367,48 @@ if uploaded:
         err_rows = []
 
         for k, idx in enumerate(work_indices, start=1):
-            sym = str(df.at[idx, ticker_col_name]).strip()
+            raw_sym = str(df.at[idx, ticker_col_name])
+
+            # Pre-filter junk/synthetic symbols
+            if skip_non_yf and looks_non_yf(raw_sym):
+                failures += 1
+                err_rows.append({
+                    "Symbol": raw_sym, "Mapped": None, "Status": "skipped_non_yahoo_format",
+                    "Sector": None, "Industry": None, "Name": None, "Country": None, "Asset_Type": None,
+                    exchange_out_col_name: None, "Error": "non_yahoo_format"
+                })
+                status.write(f"⏭️ {k}/{len(work_indices)} • {raw_sym} • skipped (non-Yahoo format)")
+                processed += 1
+                progress.progress(int(100 * processed / len(work_indices)))
+                sleep_with_jitter(request_delay, jitter_pct)
+                continue
+
+            sym = sanitize_symbol(raw_sym)
+            if not sym:
+                failures += 1
+                err_rows.append({
+                    "Symbol": raw_sym, "Mapped": None, "Status": "empty_after_sanitize",
+                    "Sector": None, "Industry": None, "Name": None, "Country": None, "Asset_Type": None,
+                    exchange_out_col_name: None, "Error": "empty_after_sanitize"
+                })
+                status.write(f"⏭️ {k}/{len(work_indices)} • {raw_sym} • skipped (empty after sanitize)")
+                processed += 1
+                progress.progress(int(100 * processed / len(work_indices)))
+                sleep_with_jitter(request_delay, jitter_pct)
+                continue
+
             exch_in = str(df.at[idx, exchange_col_name]).strip() if exchange_col_name in df.columns else None
             yf_sym = map_to_yahoo_symbol(sym, exch_in)
 
-            # Optional quick existence check (fails open; rarely returns False)
-            if do_exists_check and not cached_exists(yf_sym):
+            # Strict pre-check (fast fail to avoid 404 storms)
+            if strict_precheck and not strict_exists(yf_sym):
                 failures += 1
                 err_rows.append({
-                    "Symbol": sym, "Mapped": yf_sym, "Status": "not_found",
+                    "Symbol": raw_sym, "Mapped": yf_sym, "Status": "strict_not_found",
                     "Sector": None, "Industry": None, "Name": None, "Country": None, "Asset_Type": None,
-                    exchange_out_col_name: None, "Error": "existence_check_failed"
+                    exchange_out_col_name: None, "Error": "strict_precheck_failed"
                 })
-                status.write(f"❌ {k}/{len(work_indices)} • {sym} → {yf_sym} • not found (pre-check)")
+                status.write(f"❌ {k}/{len(work_indices)} • {raw_sym} → {yf_sym} • skipped (strict pre-check)")
                 if k % int(checkpoint_every) == 0:
                     save_checkpoint(df)
                 processed += 1
@@ -329,7 +416,23 @@ if uploaded:
                 sleep_with_jitter(request_delay, jitter_pct)
                 continue
 
-            # Fetch with retries (exponential backoff + jitter)
+            # Optional legacy existence check (fail-open)
+            if do_exists_check and not cached_exists(yf_sym):
+                failures += 1
+                err_rows.append({
+                    "Symbol": raw_sym, "Mapped": yf_sym, "Status": "not_found",
+                    "Sector": None, "Industry": None, "Name": None, "Country": None, "Asset_Type": None,
+                    exchange_out_col_name: None, "Error": "existence_check_failed"
+                })
+                status.write(f"❌ {k}/{len(work_indices)} • {raw_sym} → {yf_sym} • not found (pre-check)")
+                if k % int(checkpoint_every) == 0:
+                    save_checkpoint(df)
+                processed += 1
+                progress.progress(int(100 * processed / len(work_indices)))
+                sleep_with_jitter(request_delay, jitter_pct)
+                continue
+
+            # Fetch with retries (small backoff)
             last_err_msg = None
             result = {}
             for attempt in range(int(max_retries) + 1):
@@ -339,8 +442,8 @@ if uploaded:
                         break
                 except Exception as e:
                     last_err_msg = str(e)
-                # backoff (0.4s base like before, grows per attempt)
                 time.sleep(0.4 * (attempt + 1))
+
             sector      = result.get("sector")
             industry    = result.get("industry")
             name        = result.get("name")
@@ -374,7 +477,7 @@ if uploaded:
             if not ok:
                 failures += 1
                 err_rows.append({
-                    "Symbol": sym, "Mapped": yf_sym, "Status": "empty",
+                    "Symbol": raw_sym, "Mapped": yf_sym, "Status": "empty",
                     "Sector": sector, "Industry": industry, "Name": name, "Country": country,
                     "Asset_Type": asset_type, exchange_out_col_name: exchange_yf,
                     "Error": last_err_msg
@@ -384,7 +487,7 @@ if uploaded:
             progress.progress(int(100 * processed / len(work_indices)))
             prefix = "✅" if ok else "⚠️"
             status.write(
-                f"{prefix} {k}/{len(work_indices)} • {sym} → {yf_sym} • "
+                f"{prefix} {k}/{len(work_indices)} • {raw_sym} → {yf_sym} • "
                 f"Name='{name}' Country='{country}' Type='{asset_type}' {exchange_out_col_name}='{exchange_yf}' • "
                 f"Sector='{sector}' Industry='{industry}'"
             )
@@ -404,17 +507,12 @@ if uploaded:
         if err_rows:
             logs_df = pd.DataFrame(err_rows)
             st.session_state.logs = err_rows
-            st.subheader("Errors / Empty Results")
+            st.subheader("Errors / Skipped / Empty Results")
             st.dataframe(logs_df.head(200), use_container_width=True)
-
             csv_buf = io.StringIO()
             logs_df.to_csv(csv_buf, index=False)
-            st.download_button(
-                "⬇️ Download error log (CSV)",
-                data=csv_buf.getvalue(),
-                file_name="yf_sector_errors.csv",
-                mime="text/csv",
-            )
+            st.download_button("⬇️ Download error log (CSV)", data=csv_buf.getvalue(),
+                               file_name="yf_sector_errors.csv", mime="text/csv")
 
         st.subheader("Sample of Updated Data")
         st.dataframe(df.head(50), use_container_width=True)
