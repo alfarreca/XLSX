@@ -1,108 +1,114 @@
 import io
 import time
-import json
-import math
 import requests
 import pandas as pd
 import streamlit as st
 
-# ---------- Page + Theme ----------
-st.set_page_config(page_title="YFinance Ticker Filler", page_icon="📈", layout="wide")
-# Force a dark-ish look via lightweight CSS (works even if user theme is light)
-st.markdown("""
-<style>
-    .stApp { background: #0e1117; color: #e4e6eb; }
-    .stMarkdown, .stTextInput, .stSelectbox, .stFileUploader, .stDataFrame { color: #e4e6eb !important; }
-    .st-bk { background: #0e1117 !important; }
-    .css-1v0mbdj, .css-1dp5vir, .css-1d391kg, .stButton>button { background-color: #1b1f2a !important; color: #e4e6eb !important; border: 1px solid #2a2f3a; }
-    .stButton>button:hover { background-color: #2a2f3a !important; }
-    .stDownloadButton>button { background-color: #1b1f2a !important; color: #e4e6eb !important; border: 1px solid #2a2f3a; }
-    .stDownloadButton>button:hover { background-color: #2a2f3a !important; }
-</style>
-""", unsafe_allow_html=True)
-
-# ---------- Helpers ----------
-YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
-
-def yahoo_search(query: str, lang="en-US", quotes_count=5, news_count=0, region="US"):
+# =========================
+# Page + Dark Theme Styling
+# =========================
+st.set_page_config(page_title="YF Ticker Filler", page_icon="📈", layout="wide")
+st.markdown(
     """
-    Hit Yahoo Finance search endpoint. No API key required.
-    Returns list of quote dicts with keys like: symbol, shortname, longname, exchDisp, quoteType.
+<style>
+  .stApp { background: #0e1117; color: #e4e6eb; }
+  .stMarkdown, .stTextInput, .stSelectbox, .stFileUploader, .stDataFrame { color: #e4e6eb !important; }
+  .st-bk { background: #0e1117 !important; }
+  .stButton>button, .stDownloadButton>button {
+      background-color: #1b1f2a !important; color: #e4e6eb !important; border: 1px solid #2a2f3a;
+  }
+  .stButton>button:hover, .stDownloadButton>button:hover {
+      background-color: #2a2f3a !important;
+  }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# =========================
+# Constants & HTTP helpers
+# =========================
+YAHOO_SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+def yahoo_search(query: str, lang="en-US", quotes_count=5, news_count=0, region="US", timeout=8):
+    """
+    Call Yahoo Finance public search endpoint (no API key).
+    Returns list of quote dicts (symbol, shortname, longname, exchDisp, quoteType, ...).
     """
     params = {
         "q": query,
         "lang": lang,
         "region": region,
         "quotesCount": quotes_count,
-        "newsCount": news_count
+        "newsCount": news_count,
     }
+    headers = {"User-Agent": DEFAULT_UA}
     try:
-        r = requests.get(YAHOO_SEARCH_URL, params=params, timeout=8)
+        r = requests.get(YAHOO_SEARCH_URL, params=params, headers=headers, timeout=timeout)
         r.raise_for_status()
         data = r.json()
         return data.get("quotes", []) or []
-    except Exception as e:
+    except Exception:
         return []
 
-def pick_best_match(quotes, prefer_exchanges=None, prefer_regions=None, allow_types=("EQUITY","ETF","FUND","CURRENCY","INDEX")):
+def pick_best_match(
+    quotes,
+    prefer_exchanges=None,
+    prefer_regions=None,
+    allow_types=("EQUITY", "ETF", "FUND", "CURRENCY", "INDEX"),
+):
     """
-    Choose the 'best' match from Yahoo quotes using simple heuristics:
-    - Prefer allowed quoteType
-    - If prefer_exchanges set, prioritize those
-    - If prefer_regions set, prioritize those (based on 'exchDisp' or 'exchange' text)
-    - Then highest score/order from Yahoo
-    Return (match_dict or None)
+    Choose the 'best' match using heuristics:
+      - Prefer allowed quoteType
+      - Nudge if exchange/region matches user preference
+      - Prefer symbols that are not indices (^)
+      - Prefer EQUITY slight bias
     """
     if not quotes:
         return None
 
-    # Filter by type
-    filtered = [q for q in quotes if str(q.get("quoteType","")).upper() in allow_types]
+    allow_types = set(x.upper() for x in (allow_types or []))
+    filtered = [q for q in quotes if str(q.get("quoteType", "")).upper() in allow_types] or quotes[:]
 
-    if not filtered:
-        filtered = quotes[:]  # fallback to anything
+    pe = set(x.upper() for x in (prefer_exchanges or []))
+    pr = set(x.upper() for x in (prefer_regions or []))
 
     def score(q):
-        s = 0
-        # Yahoo doesn't give explicit score; earlier items are better → inverse index rank
-        # We'll add preferences:
+        s = 0.0
         exch_disp = (q.get("exchDisp") or "").upper()
-        exch      = (q.get("exchange") or "").upper()
-        region_ok = False
-        exchange_ok = False
+        exch = (q.get("exchange") or "").upper()
+        symbol = str(q.get("symbol", "") or "")
+        qtype = str(q.get("quoteType", "") or "").upper()
 
-        if prefer_exchanges:
-            if exch_disp in prefer_exchanges or exch in prefer_exchanges:
-                exchange_ok = True
-                s += 5
+        # Exchanges / regions nudges
+        if pe and (exch_disp in pe or exch in pe):
+            s += 5
+        if pr and any(p in (exch_disp + " " + exch) for p in pr):
+            s += 3
 
-        if prefer_regions:
-            # crude region check by display exchange label text
-            if any(pref.upper() in (exch_disp + " " + exch) for pref in prefer_regions):
-                region_ok = True
-                s += 3
-
-        # Prefer symbols that look normal (avoid caret-prefixed indices)
-        symbol = str(q.get("symbol",""))
+        # Prefer regular symbols (avoid ^ indices)
         if symbol and not symbol.startswith("^"):
             s += 1
 
-        # Prefer items with a longer display name available
+        # Prefer equities slightly
+        if qtype == "EQUITY":
+            s += 1
+
+        # Prefer richer names present
         if q.get("longname") or q.get("shortname"):
-            s += 1
-
-        # Prefer 'EQUITY' over others
-        if str(q.get("quoteType","")).upper() == "EQUITY":
-            s += 1
-
-        # Add a tiny nudge for having an exchange displayed
-        if exch_disp:
             s += 0.5
 
-        return s, exchange_ok, region_ok
+        # Small nudge for having exchange label
+        if exch_disp:
+            s += 0.25
 
-    # Sort by heuristic score (desc)
-    ranked = sorted(filtered, key=lambda q: score(q), reverse=True)
+        return s
+
+    ranked = sorted(filtered, key=score, reverse=True)
     return ranked[0] if ranked else None
 
 def safe_str(x):
@@ -111,62 +117,72 @@ def safe_str(x):
     return str(x).strip()
 
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Sheet1")
-    return out.getvalue()
+    return buf.getvalue()
 
-# ---------- UI ----------
+# =========================
+# UI
+# =========================
 st.title("📈 Auto-Fill Yahoo Finance Tickers from Excel")
-st.caption("Upload an Excel file with company **Name** (or choose the column), and I’ll find the best Yahoo Finance tickers for you.")
+st.caption("Upload an Excel with a **Name** column (or choose the column). I’ll find best-match Yahoo Finance symbols. Optimized for EU.")
 
 with st.expander("⚙️ Matching Options", expanded=True):
-    c1, c2, c3 = st.columns([1,1,1])
+    c1, c2, c3 = st.columns([1, 1, 1])
     with c1:
         prefer_regions = st.multiselect(
-            "Prefer Regions (match by exchange label text):",
-            ["US","EU","GB","DE","FR","ES","PT","IT","NL","SE","CH","IE","NO"],
-            default=["EU","GB","DE","FR","ES","PT","IT","NL","SE","CH","IE","NO"]
+            "Prefer Regions (matched via exchange label text)",
+            ["US", "EU", "GB", "DE", "FR", "ES", "PT", "IT", "NL", "SE", "CH", "IE", "NO"],
+            default=["EU", "GB", "DE", "FR", "ES", "PT", "IT", "NL", "SE", "CH", "IE", "NO"],
         )
     with c2:
         prefer_exchanges = st.multiselect(
-            "Prefer Exchanges:",
+            "Prefer Exchanges",
             [
                 "EURONEXT", "XETRA", "FRANKFURT", "LSE", "MILAN", "MADRID", "SIX SWISS",
-                "NASDAQ","NYSE","AMEX","OSLO","STOCKHOLM","HELSINKI","COPENHAGEN","BRUSSELS","LISBON","DUBLIN"
+                "NASDAQ", "NYSE", "AMEX", "OSLO", "STOCKHOLM", "HELSINKI", "COPENHAGEN",
+                "BRUSSELS", "LISBON", "DUBLIN",
             ],
-            default=["EURONEXT","XETRA","FRANKFURT","LSE","MILAN","MADRID","SIX SWISS","LISBON","BRUSSELS","DUBLIN"]
+            default=["EURONEXT", "XETRA", "FRANKFURT", "LSE", "MILAN", "MADRID", "SIX SWISS", "LISBON", "BRUSSELS", "DUBLIN"],
         )
     with c3:
         allow_types = st.multiselect(
-            "Allow Quote Types:",
-            ["EQUITY","ETF","FUND","CURRENCY","INDEX"],
-            default=["EQUITY","ETF","FUND"]
+            "Allow Quote Types",
+            ["EQUITY", "ETF", "FUND", "CURRENCY", "INDEX"],
+            default=["EQUITY", "ETF", "FUND"],
         )
 
 uploaded = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 
 if uploaded:
+    # Read
     try:
         df = pd.read_excel(uploaded)
     except Exception as e:
         st.error(f"Could not read the Excel file: {e}")
         st.stop()
 
+    if df.empty:
+        st.warning("The uploaded Excel is empty.")
+        st.stop()
+
     st.subheader("Preview")
     st.dataframe(df.head(20), use_container_width=True)
 
-    # Column selection
+    # Column mapping
     cols = list(df.columns)
     st.markdown("### Column Mapping")
-    c1, c2 = st.columns(2)
-    with c1:
-        name_col = st.selectbox("Column with **Company Name**", options=cols, index=min(cols.index("Name"), len(cols)-1) if "Name" in cols else 0)
-    with c2:
+    col1, col2 = st.columns(2)
+    with col1:
+        default_name_idx = cols.index("Name") if "Name" in cols else 0
+        name_col = st.selectbox("Column with **Company Name**", options=cols, index=default_name_idx)
+    with col2:
         symbol_col_existing = st.selectbox("Existing Symbol column (optional)", options=["<none>"] + cols, index=0)
 
-    # Optional filters (e.g., restrict processing to blank symbols only)
+    # Behavior toggles
     only_fill_blank = st.checkbox("Only fill rows where Symbol is blank/missing", value=True)
+    rate_limit_ms = st.slider("Per-row delay (ms) to be gentle with Yahoo", min_value=0, max_value=1000, value=150, step=50)
 
     st.markdown("---")
     run = st.button("🔎 Fetch Best-Match Tickers")
@@ -176,84 +192,99 @@ if uploaded:
             st.error("Please select the company name column.")
             st.stop()
 
-        # Prepare output columns
         out_df = df.copy()
 
-        # If existing symbol column is present and we only want to fill blanks, honor it
+        # Prepare Symbol column to write into
         if symbol_col_existing != "<none>" and symbol_col_existing in out_df.columns:
-            needs_fill_mask = out_df[symbol_col_existing].isna() | (out_df[symbol_col_existing].astype(str).str.strip() == "")
+            symbol_col = symbol_col_existing
         else:
-            # No existing symbol column → create one
-            symbol_col_existing = "Symbol"
+            symbol_col = "Symbol"
             if "Symbol" not in out_df.columns:
                 out_df["Symbol"] = ""
-            needs_fill_mask = (out_df["Symbol"].astype(str).str.strip() == "")
 
-        if not only_fill_blank:
-            needs_fill_mask = pd.Series([True] * len(out_df))
+        if only_fill_blank:
+            needs_fill_mask = out_df[symbol_col].isna() | (out_df[symbol_col].astype(str).str.strip() == "")
+        else:
+            needs_fill_mask = pd.Series([True] * len(out_df), index=out_df.index)
+
+        total = int(needs_fill_mask.sum())
+        if total == 0:
+            st.info("Nothing to fill. All rows already have symbols (or filter left no rows).")
+            # Still allow download of current out_df
+            st.download_button(
+                "📥 Download Excel (unchanged)",
+                data=to_excel_bytes(out_df),
+                file_name="with_yf_symbols.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+            st.stop()
 
         results = []
-        total = int(needs_fill_mask.sum())
         progress = st.progress(0)
         status = st.empty()
 
+        pe = [x.upper() for x in prefer_exchanges] if prefer_exchanges else None
+        pr = [x.upper() for x in prefer_regions] if prefer_regions else None
+        at = [x.upper() for x in allow_types] if allow_types else None
+
         for i, (idx, row) in enumerate(out_df[needs_fill_mask].iterrows(), start=1):
             company = safe_str(row[name_col])
-            progress.progress(min(i/total, 1.0) if total else 1.0)
-            status.write(f"Searching: {company}")
+            progress.progress(min(i / max(total, 1), 1.0))
+            status.write(f"Searching: {company if company else '(blank)'}")
 
             if not company:
-                results.append((idx, "", "", "", "", "", 0.0))
+                # No query → no match
+                results.append(
+                    (idx, "", "", "", "", "", 0.0)
+                )
                 continue
 
             quotes = yahoo_search(company, lang="en-US", quotes_count=6, news_count=0, region="US")
-            match = pick_best_match(quotes,
-                                    prefer_exchanges=[x.upper() for x in prefer_exchanges] if prefer_exchanges else None,
-                                    prefer_regions=[x.upper() for x in prefer_regions] if prefer_regions else None,
-                                    allow_types=[x.upper() for x in allow_types] if allow_types else None)
+            match = pick_best_match(quotes, prefer_exchanges=pe, prefer_regions=pr, allow_types=at)
 
             if match:
-                symbol = match.get("symbol","")
-                shortname = match.get("shortname","") or ""
-                longname = match.get("longname","") or ""
-                exch_disp = match.get("exchDisp","") or match.get("exchange","") or ""
-                qtype = match.get("quoteType","")
-                # crude confidence heuristic: first item + matching prefs already handled in picker
-                # we'll assign simple tiers for user transparency:
-                conf = 0.85 if qtype.upper() == "EQUITY" else 0.75
+                symbol = match.get("symbol", "") or ""
+                shortname = match.get("shortname", "") or ""
+                longname = match.get("longname", "") or ""
+                exch_disp = match.get("exchDisp", "") or match.get("exchange", "") or ""
+                qtype = match.get("quoteType", "") or ""
+                conf = 0.85 if (qtype or "").upper() == "EQUITY" else 0.75
             else:
                 symbol, shortname, longname, exch_disp, qtype, conf = "", "", "", "", "", 0.0
 
-            out_df.loc[idx, symbol_col_existing] = symbol
+            out_df.at[idx, symbol_col] = symbol
             results.append((idx, symbol, shortname, longname, exch_disp, qtype, conf))
-            time.sleep(0.15)  # be gentle
+
+            # Be gentle
+            if rate_limit_ms:
+                time.sleep(rate_limit_ms / 1000)
 
         status.empty()
         progress.empty()
 
-        res_df = pd.DataFrame(results, columns=["_row_idx","Symbol","YF_ShortName","YF_LongName","Exchange","QuoteType","Confidence"])
-        # Merge back for user review
-        review_df = out_df.merge(res_df.drop(columns=["_row_idx"]), left_index=True, right_on="_row_idx", how="left")
-        review_df.drop(columns=["_row_idx"], inplace=True, errors="ignore")
+        # Build review table (FIX: use index-aligned join, not merge on dropped key)
+        res_df = pd.DataFrame(
+            results,
+            columns=["_row_idx", "Symbol", "YF_ShortName", "YF_LongName", "Exchange", "QuoteType", "Confidence"],
+        )
+        review_df = out_df.join(res_df.set_index("_row_idx"), how="left")
 
-        st.success("Done! Review the matches below.")
+        st.success("Done! Review proposed matches below.")
         st.dataframe(review_df, use_container_width=True)
 
-        # Download updated Excel
-        xlsx_bytes = to_excel_bytes(out_df)
+        # Download updated Excel (just the filled symbols)
         st.download_button(
             label="📥 Download Excel with Symbols",
-            data=xlsx_bytes,
+            data=to_excel_bytes(out_df),
             file_name="with_yf_symbols.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        with st.expander("🔍 Debug view (raw Yahoo candidates per name)"):
-            # Optional: show raw candidates for the last 10 processed names for transparency
-            st.write("For transparency, you can inspect how Yahoo matched your queries. (Disabled by default for performance.)")
-            st.caption("Tip: If you need this expanded for all rows, tell me and I’ll add a CSV export of all candidates per name.")
+        with st.expander("🔍 Transparency: Last 50 matches"):
+            st.dataframe(review_df.tail(50), use_container_width=True)
+
 else:
-    st.info("Upload an Excel file to begin. Example columns: **Name** (required or selectable), optional **Symbol** to fill in.")
+    st.info("Upload an Excel file to begin. Example columns: **Name** (required or selectable), optional **Symbol** to fill-in.")
 
 st.markdown("---")
 st.caption("Made for Streamlit Cloud • Fills Yahoo Finance tickers from your uploaded list • Dark UI")
